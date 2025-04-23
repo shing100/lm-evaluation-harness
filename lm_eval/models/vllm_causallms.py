@@ -1,4 +1,5 @@
 import copy
+import logging
 from importlib.metadata import version
 from importlib.util import find_spec
 from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple, Union
@@ -17,7 +18,6 @@ from lm_eval.models.utils import (
     undistribute,
 )
 from lm_eval.utils import (
-    eval_logger,
     get_rolling_token_windows,
     make_disjoint_window,
 )
@@ -28,13 +28,16 @@ try:
     from vllm import LLM, SamplingParams
     from vllm.lora.request import LoRARequest
     from vllm.transformers_utils.tokenizer import get_tokenizer
+
+    if parse_version(version("vllm")) >= parse_version("0.8.3"):
+        from vllm.entrypoints.chat_utils import resolve_hf_chat_template
 except ModuleNotFoundError:
     pass
 
 if TYPE_CHECKING:
     pass
 
-eval_logger = eval_logger
+eval_logger = logging.getLogger(__name__)
 
 
 @register_model("vllm")
@@ -113,24 +116,35 @@ class VLLM(TemplateLM):
             self.batch_size = "auto"
             eval_logger.info("Manual batching is not compatible with data parallelism.")
 
-            from transformers import AutoConfig
+        from transformers import AutoConfig
 
-            self._config = AutoConfig.from_pretrained(
-                pretrained, trust_remote_code=trust_remote_code, revision=revision
-            )
+        self._config = AutoConfig.from_pretrained(
+            pretrained, trust_remote_code=trust_remote_code, revision=revision
+        )
         self.tokenizer = get_tokenizer(
             tokenizer if tokenizer else pretrained,
             tokenizer_mode=tokenizer_mode,
             trust_remote_code=trust_remote_code,
             revision=tokenizer_revision,
+            add_bos_token=add_bos_token,
         )
-        self.tokenizer = configure_pad_token(self.tokenizer)
+        self.tokenizer = configure_pad_token(self.tokenizer, model_config=self._config)
         self.add_bos_token = add_bos_token
         if "gemma" in pretrained.lower():
             self.add_bos_token = True
             eval_logger.info(
                 "Found 'gemma' in model name, a BOS token will be used as Gemma series models underperform without it."
             )
+
+        if parse_version(version("vllm")) >= parse_version("0.8.3"):
+            self.hf_chat_template = resolve_hf_chat_template(
+                tokenizer=self.tokenizer,
+                chat_template=None,
+                tools=None,
+                trust_remote_code=trust_remote_code,
+            )
+        else:
+            self.hf_chat_template = None
 
         self.custom_prefix_token_id = prefix_token_id
         if prefix_token_id is not None:
@@ -194,6 +208,7 @@ class VLLM(TemplateLM):
             tokenize=False,
             add_generation_prompt=add_generation_prompt,
             continue_final_message=not add_generation_prompt,
+            chat_template=self.hf_chat_template,
         )
 
         return chat_templated
@@ -243,13 +258,13 @@ class VLLM(TemplateLM):
                 temperature=0, prompt_logprobs=1, max_tokens=1, detokenize=False
             )
         if self.data_parallel_size > 1:
-            # vLLM hangs if tensor_parallel > 1 and resources are set in ray.remote
+            # vLLM hangs if resources are set in ray.remote
             # also seems to only work with decorator and not with ray.remote() fn
             # see https://github.com/vllm-project/vllm/issues/973
-            @ray.remote(num_gpus=1 if self.tensor_parallel_size == 1 else None)
+            @ray.remote
             def run_inference_one_model(
                 model_args: dict,
-                sampling_params,
+                sampling_params: SamplingParams,
                 requests: List[List[int]],
                 lora_request: LoRARequest,
             ):
@@ -558,6 +573,7 @@ class VLLM(TemplateLM):
     @staticmethod
     def modify_gen_kwargs(kwargs: dict) -> dict:
         # sampling_params
+        kwargs["temperature"] = kwargs.get("temperature", 0.0)
         do_sample = kwargs.pop("do_sample", None)
         if do_sample is False and "temperature" not in kwargs:
             eval_logger.debug(

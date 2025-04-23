@@ -3,6 +3,7 @@ import asyncio
 import copy
 import itertools
 import json
+import logging
 from functools import cached_property
 from typing import (
     Any,
@@ -37,6 +38,8 @@ from lm_eval.api.model import TemplateLM
 from lm_eval.models.utils import Collator, chunks, configure_pad_token
 
 
+eval_logger = logging.getLogger(__name__)
+
 LogLikelihoodInputs = Tuple[Tuple[str, str], List[int], List[int]]
 
 
@@ -46,9 +49,6 @@ class JsonChatStr(NamedTuple):
 
     def encode(self, encoding):
         return self.prompt.encode(encoding)
-
-
-eval_logger = utils.eval_logger
 
 
 class TemplateAPI(TemplateLM):
@@ -475,7 +475,7 @@ class TemplateAPI(TemplateLM):
         **kwargs,
     ) -> Union[List[List[str]], List[List[Tuple[float, bool]]]]:
         ctxlens = ctxlens if ctxlens else [None] * len(requests)
-        conn = TCPConnector(limit=self._concurrent)
+        conn = TCPConnector(limit=self._concurrent, ssl=self.verify_certificate)
         async with ClientSession(
             connector=conn, timeout=ClientTimeout(total=self.timeout)
         ) as session:
